@@ -4,12 +4,163 @@
 # rpcd 协议：`<script> list` 输出方法表；`<script> call <method>` 从 stdin
 # 读 JSON 参数，把结果 JSON 打到 stdout。
 #
-# 这里只是协议壳，真正的逻辑在 /usr/share/lanmap/rpc.uc：
-# 用 ucode 是为了能直接解析 nft 的 JSON、读 TSV、查 OUI 表，
-# 用 shell 做这些会又慢又难读。
+# 业务逻辑在 /usr/share/lanmap/rpc.uc：用 ucode 是为了能直接解析 nft 的
+# JSON、读 TSV、查 OUI 表，用 shell 做这些会又慢又难读。
+#
+# 例外是插件自更新：它要做 curl + sha256 校验 + apk add，全是 shell 的活，
+# 放在这里比绕进 ucode 更直接（ucode 没有 socket 模块）。
 
 BIN=/usr/bin/ucode
 LIB=/usr/share/lanmap/rpc.uc
+
+# json_init / json_add_* / json_dump 来自 libubox，自更新那段要用
+[ -f /usr/share/libubox/jshn.sh ] && . /usr/share/libubox/jshn.sh
+
+# ---- 自更新用的路径与常量 ----
+SELF_REPO='novzhhho/luci-app-lanmap'
+BUILD_FILE=/usr/share/luci-app-lanmap/build
+SELF_CACHE=/tmp/lanmap-self.json
+UA='luci-app-lanmap'
+
+reply_err() {
+	printf '{"ok":false,"error":"%s"}\n' "$(printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g')"
+}
+
+# 本地构建指纹：CI 把 commit 短 sha 写进来；开发期直接铺文件时没有这个文件
+self_local() {
+	[ -f "$BUILD_FILE" ] || { echo 'dev'; return; }
+	tr -d ' \r\n' < "$BUILD_FILE" 2>/dev/null
+}
+
+# ---------------------------------------------------------------- selfstatus
+# 不发网络请求，只读缓存。前端首屏就能拿到当前版本，不会拖慢列表。
+do_self_status() {
+	local local_sha remote has pub size
+
+	local_sha=$(self_local)
+	remote=''; has=0; pub=''; size=0
+
+	if [ -f "$SELF_CACHE" ]; then
+		remote=$(jsonfilter -i "$SELF_CACHE" -e '@.tag' 2>/dev/null)
+		pub=$(jsonfilter -i "$SELF_CACHE" -e '@.published_at' 2>/dev/null)
+		size=$(jsonfilter -i "$SELF_CACHE" -e '@.size' 2>/dev/null)
+		[ -n "$remote" ] && [ "$remote" != "$local_sha" ] && has=1
+	fi
+
+	printf '{"ok":true,"local":"%s","remote":"%s","has_update":%s,"published_at":"%s","size":%s}\n' \
+		"$local_sha" "$remote" "$has" "$pub" "${size:-0}"
+}
+
+# ---------------------------------------------------------------- selfcheck
+do_self_check() {
+	local api tmp code tag url size pub local_sha has
+
+	api="https://api.github.com/repos/$SELF_REPO/releases/latest"
+	tmp=/tmp/lanmap-self-release.json
+	rm -f "$tmp"
+
+	# curl 不在的话退回 uclient-fetch，两者行为在这里够用
+	if command -v curl >/dev/null 2>&1; then
+		code=$(curl -sS -o "$tmp" -w '%{http_code}' \
+			--retry 2 --connect-timeout 10 -m 30 \
+			-H 'Accept: application/vnd.github+json' \
+			-H "User-Agent: $UA" "$api" 2>/dev/null)
+	else
+		if uclient-fetch -q -O "$tmp" --timeout=30 \
+			--header="Accept: application/vnd.github+json" \
+			--header="User-Agent: $UA" "$api" 2>/dev/null; then
+			code=200
+		else
+			code=''
+		fi
+	fi
+
+	case "$code" in
+		200) ;;
+		404) reply_err "仓库还没有发布过构建（HTTP 404）"; return ;;
+		403) reply_err "GitHub API 被限流（HTTP 403），过几分钟再试"; return ;;
+		''|000) reply_err "连不上 GitHub API，检查路由器网络或 DNS"; return ;;
+		*) reply_err "GitHub API 返回 HTTP $code"; return ;;
+	esac
+
+	tag=$(jsonfilter -i "$tmp" -e '@.tag_name' 2>/dev/null)
+	[ -n "$tag" ] || { reply_err "解析 Release 失败（没有 tag_name）"; return; }
+
+	url=$(jsonfilter -i "$tmp" -e '@.assets[*].browser_download_url' 2>/dev/null \
+		| grep 'luci-app-lanmap.*\.apk$' | head -n1)
+	[ -n "$url" ] || { reply_err "该 Release 里没有插件 apk"; return; }
+
+	size=$(jsonfilter -i "$tmp" -e "@.assets[@.name=\"${url##*/}\"].size" 2>/dev/null)
+	pub=$(jsonfilter -i "$tmp" -e '@.published_at' 2>/dev/null)
+
+	json_init
+	json_add_string tag "$tag"
+	json_add_string url "$url"
+	json_add_int size "${size:-0}"
+	json_add_string published_at "$pub"
+	json_add_int checked_at "$(date +%s)"
+	json_dump > "$SELF_CACHE"
+	json_cleanup
+
+	local_sha=$(self_local)
+	has=0
+	[ "$tag" != "$local_sha" ] && has=1
+
+	printf '{"ok":true,"local":"%s","remote":"%s","url":"%s","size":%s,"published_at":"%s","has_update":%s}\n' \
+		"$local_sha" "$tag" "$url" "${size:-0}" "$pub" "$has"
+}
+
+# ---------------------------------------------------------------- selfupdate
+do_self_update() {
+	local url dir name sums_url out rc before after
+
+	url=$(jsonfilter -i "$SELF_CACHE" -e '@.url' 2>/dev/null)
+	[ -n "$url" ] || { reply_err "请先检查更新"; return; }
+
+	dir=/tmp/lanmap-upd
+	rm -rf "$dir"; mkdir -p "$dir"
+	name=${url##*/}
+
+	curl -fsSL --retry 2 --connect-timeout 10 -m 180 -o "$dir/$name" "$url" 2>/dev/null \
+		|| { rm -rf "$dir"; reply_err "下载插件包失败（网络或 GitHub 不可达）"; return; }
+	[ -s "$dir/$name" ] || { rm -rf "$dir"; reply_err "下载到的插件包为空"; return; }
+
+	# 和包一起发布的 SHA256SUMS.txt，用来挡掉截断和中间人改写。
+	# 校验文件拿不到就不装 —— 宁可失败也不装一个没核对过的包。
+	sums_url="${url%/*}/SHA256SUMS.txt"
+	curl -fsSL --retry 1 --connect-timeout 8 -m 30 -o "$dir/SHA256SUMS.txt" "$sums_url" 2>/dev/null
+	if [ ! -s "$dir/SHA256SUMS.txt" ]; then
+		rm -rf "$dir"
+		reply_err "拿不到 SHA256SUMS.txt，无法校验，已放弃安装"
+		return
+	fi
+
+	out=$( cd "$dir" && sha256sum -c SHA256SUMS.txt 2>&1 )
+	case "$out" in
+		*"$name: OK"*) ;;
+		*) rm -rf "$dir"
+		   reply_err "校验失败，已放弃安装：$out"
+		   return ;;
+	esac
+
+	before=$(self_local)
+	out=$(apk add --no-network --allow-untrusted --force-overwrite "$dir/$name" 2>&1)
+	rc=$?
+	rm -rf "$dir"
+
+	if [ "$rc" != 0 ]; then
+		reply_err "安装失败：$out"
+		return
+	fi
+
+	after=$(self_local)
+	rm -f "$SELF_CACHE"
+
+	# 这里**不能** reload rpcd：本次调用正由它处理，重启会把回包弄丢。
+	# apk 覆盖后下一次 call 自然会用新脚本，不需要重启；
+	# 只有全新安装才需要，那由 post-install 负责。
+	printf '{"ok":true,"before":"%s","after":"%s"}\n' "$before" "$after"
+}
 
 case "$1" in
 	list)
@@ -21,7 +172,10 @@ case "$1" in
 			"scan":    {},
 			"summary": {},
 			"status":  {},
-			"log":     {}
+			"log":     {},
+			"selfstatus": {},
+			"selfcheck":  {},
+			"selfupdate": {}
 		}
 		EOF
 		;;
@@ -30,6 +184,9 @@ case "$1" in
 			devices|detail|setmeta|scan|summary|status|log)
 				exec "$BIN" "$LIB" "$2"
 				;;
+			selfstatus) do_self_status ;;
+			selfcheck)  do_self_check ;;
+			selfupdate) do_self_update ;;
 			*)
 				echo '{"ok":false,"error":"未知方法"}'
 				;;

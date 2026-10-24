@@ -72,8 +72,10 @@ jobs:
           mv "/tmp/$PKG_NAME.list" "$ROOT/lib/apk/packages/$PKG_NAME.list"
 
           # ---- 安装脚本 ----
-          # 升级时正在处理请求的可能是 rpcd，reload 会把回包弄丢；
-          # 但这里的升级是用户手动 apk add，不经过 rpcd，所以可以安全 reload。
+          # post-upgrade 里**不能** reload rpcd：插件内更新点「立即更新」时，
+          # 这次 apk add 是由 rpcd 调起的子进程，reload 会把 rpcd 一起重启，
+          # 正在等回包的请求直接超时。apk 覆盖后下一次 call 本来就用新脚本，
+          # 不需要重启；只有全新安装（APK 不是从 rpcd 里装的）才需要 reload。
           cat > build/apkscripts/post-install <<'EOS'
           #!/bin/sh
           mkdir -p /usr/share/lanmap/data /var/run/lanmap 2>/dev/null
@@ -84,7 +86,7 @@ jobs:
           EOS
           cat > build/apkscripts/post-upgrade <<'EOS'
           #!/bin/sh
-          /etc/init.d/rpcd reload >/dev/null 2>&1
+          /etc/init.d/lanmap enable >/dev/null 2>&1
           /etc/init.d/lanmap restart >/dev/null 2>&1
           exit 0
           EOS

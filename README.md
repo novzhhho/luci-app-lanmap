@@ -86,7 +86,34 @@ apk add --allow-untrusted --force-overwrite luci-app-lanmap-*.apk
 
 装完菜单在 **网络 → 设备管理**。
 
-校验包没被改动过：
+## 插件内更新
+
+页面底部的版本条就是更新入口。它比对的是**本地烧进去的 commit 短 sha**
+（`/usr/share/luci-app-lanmap/build`，CI 打包时写入）和 GitHub 最新 Release 的 tag。
+
+```
+luci-app-lanmap · e1fcfe7                    [检查更新]
+发现新版本 a1b2c3d（当前 e1fcfe7）              [立即更新]
+```
+
+点「立即更新」后依次做：
+
+1. 从 Release 下载 apk；
+2. 同时下载 `SHA256SUMS.txt` 并 `sha256sum -c` 校验 —— **拿不到校验文件就不装**，
+   截断或中间人改写都会被拦住；
+3. `apk add --no-network --allow-untrusted --force-overwrite` 覆盖安装；
+4. 刷新页面。
+
+升级保留 `/etc/lanmap/devices.json`（别名、图标、禁网状态）和历史 TSV 数据。
+
+> **实现上的一个坑**：`post-upgrade` 里**不能** `reload rpcd`。这次 `apk add` 是
+> rpcd 调起的子进程，reload 会把 rpcd 一起重启，正在等回包的请求直接超时。
+> apk 覆盖后下一次调用本来就用新脚本，不需要重启；只有全新安装才需要。
+
+检查更新要能连 `api.github.com`。路由器上如果是纯 IPv6 或 DNS 有污染，
+会直接报「连不上 GitHub API」，不影响插件其它功能。
+
+## 校验包没被改动过
 
 ```sh
 sha256sum -c SHA256SUMS.txt
@@ -149,7 +176,7 @@ python3 tools/gen-oui.py --check
 ```
 root/usr/sbin/lanmapd                 采集服务（ucode + uloop，常驻）
 root/usr/share/lanmap/rpc.uc          rpcd 的业务逻辑（数据合并、识别、汇总）
-root/usr/libexec/rpcd/luci.lanmap     rpcd 协议壳（list / call 分发）
+root/usr/libexec/rpcd/luci.lanmap     rpcd 协议壳（list / call 分发）+ 插件自更新
 htdocs/.../view/lanmap/overview.js    界面
 ```
 

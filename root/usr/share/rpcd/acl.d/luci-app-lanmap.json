@@ -3,12 +3,12 @@
 		"description": "Grant access to the lanmap ubus object",
 		"read": {
 			"ubus": {
-				"luci.lanmap": [ "devices", "detail", "summary", "status", "log" ]
+				"luci.lanmap": [ "devices", "detail", "summary", "status", "log", "selfstatus", "selfcheck" ]
 			}
 		},
 		"write": {
 			"ubus": {
-				"luci.lanmap": [ "setmeta", "scan" ]
+				"luci.lanmap": [ "setmeta", "scan", "selfupdate" ]
 			}
 		}
 	}

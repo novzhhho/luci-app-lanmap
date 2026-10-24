@@ -28,6 +28,11 @@ var callRename = rpc.declare({ object: 'luci.lanmap', method: 'setmeta', params:
 var callSetType = rpc.declare({ object: 'luci.lanmap', method: 'setmeta', params: [ 'mac', 'type' ], expect: { '': {} } });
 var callBlock = rpc.declare({ object: 'luci.lanmap', method: 'setmeta', params: [ 'mac', 'blocked' ], expect: { '': {} } });
 
+/* 插件自更新：status 只读缓存不发网络，check/update 才碰 GitHub */
+var callSelfStatus = rpc.declare({ object: 'luci.lanmap', method: 'selfstatus', expect: { '': {} } });
+var callSelfCheck = rpc.declare({ object: 'luci.lanmap', method: 'selfcheck', expect: { '': {} } });
+var callSelfUpdate = rpc.declare({ object: 'luci.lanmap', method: 'selfupdate', expect: { '': {} } });
+
 /* ---------------- 图标（内联 SVG，随主题变色，合计约 3KB） ---------------- */
 
 var ICON = {
@@ -298,6 +303,26 @@ var CSS = `
 
 .lm-empty{padding:3rem 1.25rem;text-align:center;color:var(--gray,#8898aa);font-size:1rem}
 
+/* ---------- 版本 / 插件更新 ---------- */
+.lm-foot{display:flex;align-items:center;gap:.6rem;flex-wrap:wrap;
+  padding:.8rem 1.25rem;border-top:1px solid var(--border-color,#dee2e6);
+  font-size:.9375rem;color:var(--gray,#8898aa)}
+.lm-foot b{color:inherit;font-weight:600;font-variant-numeric:tabular-nums;
+  letter-spacing:.01em}
+/* 左侧文字可压缩，右侧按钮不换行：窄屏时文字省略而不是把按钮挤到下一行 */
+.lm-foot>span{min-width:0}
+.lm-foot>span:first-child{flex:1 1 auto;overflow:hidden;text-overflow:ellipsis;
+  white-space:nowrap}
+.lm-foot .lm-sp{margin-left:auto;flex:none;display:flex;align-items:center;gap:.5rem}
+/* 有新版本时整条染成主色，不用弹窗也能注意到 */
+.lm-foot.upd{border-top-color:rgba(94,114,228,.35);background:rgba(94,114,228,.07);
+  color:inherit}
+.lm-foot.upd b{color:var(--primary,#5e72e4)}
+.lm-spin{display:inline-block;width:.85rem;height:.85rem;border-radius:50%;
+  border:2px solid rgba(136,152,170,.35);border-top-color:var(--primary,#5e72e4);
+  animation:lm-spin .7s linear infinite;vertical-align:-.1rem;margin-right:.4rem}
+@keyframes lm-spin{to{transform:rotate(360deg)}}
+
 /* ---------- 详情 ---------- */
 .lm-back{display:inline-flex;align-items:center;gap:.35rem;padding:.85rem 1.25rem .1rem;
   font-size:.9375rem;color:var(--gray,#8898aa);background:none;border:0;cursor:pointer;
@@ -399,6 +424,10 @@ var CSS = `
   .lm-flow{flex-wrap:wrap}
   .lm-flow>div{flex:1 1 50%}
   .lm-hero .lm-hname{font-size:1.5rem}
+  /* 版本条：窄屏收字号并省掉「（当前 xxx）」，保证文字和按钮同一行 */
+  .lm-foot{font-size:.875rem;padding-left:1rem;padding-right:1rem}
+  .lm-foot .lm-btn{height:2.2rem;padding:0 .6rem;font-size:.875rem}
+  .lm-cur{display:none}
 }
 `;
 
@@ -406,7 +435,13 @@ var CSS = `
 
 return view.extend({
 	load: function () {
-		return Promise.all([ callDevices(), callStatus() ]);
+		/* selfstatus 只读缓存不发网络；老版本后端没有这个方法，
+		   这里单独 catch，避免整个页面跟着 Reject */
+		return Promise.all([
+			callDevices(),
+			callStatus(),
+			callSelfStatus().catch(function () { return null; })
+		]);
 	},
 
 	render: function (res) {
@@ -418,6 +453,17 @@ return view.extend({
 		this.detail = null;
 		this.picker = false;
 		this.sig = '';
+
+		var sv = (res[2] && res[2].ok) ? res[2] : {};
+		this.upd = {
+			local: sv.local || '',
+			remote: sv.remote || '',
+			has: !!sv.has_update,
+			checked: !!sv.remote,
+			busy: false,
+			msg: '',
+			err: ''
+		};
 
 		this.wrap = E('div', { class: 'cbi-section' });
 
@@ -505,8 +551,10 @@ return view.extend({
 		}));
 
 		this.listBox = E('div', {});
-		this.wrap.replaceChildren(hd, tabbar, this.listBox);
+		this.updBox = E('div', { class: 'lm-foot' });
+		this.wrap.replaceChildren(hd, tabbar, this.listBox, this.updBox);
 		this.renderRows();
+		this.renderUpdBox();
 	},
 
 	renderRows: function () {
@@ -550,6 +598,116 @@ return view.extend({
 			out.push(E('div', { class: 'lm-empty' }, q ? '没有匹配的设备' : '暂无设备'));
 
 		this.listBox.replaceChildren.apply(this.listBox, out);
+	},
+
+	/* ---------- 版本 / 更新 ---------- */
+
+	renderUpdBox: function () {
+		if (!this.updBox || !this.upd) return;
+
+		var self = this;
+		var u = this.upd;
+		var local = u.local || 'dev';
+
+		var text;
+		if (u.has)
+			text = [ '发现新版本 ', E('b', {}, u.remote),
+				E('span', { class: 'lm-cur' }, [ '（当前 ', E('b', {}, local), '）' ]) ];
+		else if (u.checked)
+			text = [ 'luci-app-lanmap · ', E('b', {}, local), ' · 已是最新' ];
+		else
+			text = [ 'luci-app-lanmap · ', E('b', {}, local) ];
+
+		var right;
+		if (u.busy) {
+			right = E('span', {}, [ E('span', { class: 'lm-spin' }), u.msg || '处理中…' ]);
+		}
+		else if (u.has) {
+			right = E('button', {
+				class: 'lm-btn lm-primary',
+				click: function () { self.doSelfUpdate(); }
+			}, '立即更新');
+		}
+		else {
+			right = E('button', {
+				class: 'lm-btn',
+				click: function () { self.doSelfCheck(); }
+			}, u.checked ? '再检查一次' : '检查更新');
+		}
+
+		this.updBox.className = 'lm-foot' + (u.has ? ' upd' : '');
+		this.updBox.replaceChildren(
+			E('span', {}, text),
+			E('span', { class: 'lm-sp' }, right)
+		);
+	},
+
+	doSelfCheck: function () {
+		var self = this;
+		if (this.upd.busy) return;
+
+		this.upd.busy = true;
+		this.upd.msg = '正在检查更新…';
+		this.renderUpdBox();
+
+		return callSelfCheck().then(function (r) {
+			self.upd.busy = false;
+			self.upd.msg = '';
+
+			if (!r || !r.ok) {
+				self.upd.err = (r && r.error) || '检查更新失败';
+				self.renderUpdBox();
+				ui.addNotification(null, E('p', {}, self.upd.err));
+				return;
+			}
+
+			self.upd.local = r.local || 'dev';
+			self.upd.remote = r.remote || '';
+			self.upd.has = !!r.has_update;
+			self.upd.checked = true;
+			self.upd.err = '';
+			self.renderUpdBox();
+
+			if (!self.upd.has)
+				ui.addNotification(null, E('p', {}, '已经是最新版本'), 'info');
+		}).catch(function () {
+			self.upd.busy = false;
+			self.upd.msg = '';
+			self.renderUpdBox();
+			ui.addNotification(null, E('p', {}, '检查更新失败：请求超时或中断'));
+		});
+	},
+
+	doSelfUpdate: function () {
+		var self = this;
+		if (this.upd.busy) return;
+
+		this.upd.busy = true;
+		this.upd.msg = '正在下载并安装…';
+		this.renderUpdBox();
+
+		return callSelfUpdate().then(function (r) {
+			if (!r || !r.ok) {
+				self.upd.busy = false;
+				self.upd.msg = '';
+				self.renderUpdBox();
+				ui.addNotification(null, E('p', {}, (r && r.error) || '更新失败'));
+				return;
+			}
+
+			/* 安装成功后 apk 已经覆盖了旧文件，刷新页面就会加载新界面。
+			   后端刻意没有 reload rpcd（会把这次调用的回包弄丢）。 */
+			self.upd.msg = '已更新到 ' + (r.after || '新版本') + '，正在刷新…';
+			self.upd.has = false;
+			self.upd.local = r.after || self.upd.local;
+			self.renderUpdBox();
+			window.setTimeout(function () { window.location.reload(); }, 1200);
+		}).catch(function () {
+			self.upd.busy = false;
+			self.upd.msg = '';
+			self.renderUpdBox();
+			ui.addNotification(null, E('p', {}, '更新失败：请求超时或中断'));
+		});
 	},
 
 	row: function (x) {
