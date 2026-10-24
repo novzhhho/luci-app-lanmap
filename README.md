@@ -76,11 +76,33 @@ chain lanout { type filter hook egress device "br-lan" }
 ```sh
 # 从 Release 下载对应 apk
 apk add --allow-untrusted --force-overwrite luci-app-lanmap-*.apk
+
+# 装完确认服务在跑
+/etc/init.d/lanmap enable
+/etc/init.d/lanmap restart
 ```
 
 依赖：`luci-base rpcd nftables ucode ucode-mod-fs ucode-mod-uloop ucode-mod-uci`
 
 装完菜单在 **网络 → 设备管理**。
+
+校验包没被改动过：
+
+```sh
+sha256sum -c SHA256SUMS.txt
+```
+
+卸载：
+
+```sh
+apk del luci-app-lanmap
+```
+
+运行期产生的历史数据不归 apk 管，想彻底清干净再删这几个：
+
+```sh
+rm -rf /usr/share/lanmap/data /etc/lanmap /var/run/lanmap
+```
 
 服务管理：
 

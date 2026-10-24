@@ -134,7 +134,10 @@ jobs:
             A=/w/dist/luci-app-lanmap-*.apk
 
             echo "=== 包信息 ==="
-            apk adbdump $A | head -30
+            apk adbdump $A | head -20
+
+            echo "=== 包内完整文件树（含 sha256，可与仓库文件比对）==="
+            apk adbdump $A
 
             echo "=== 必须存在的文件 ==="
             # apk-tools 3 的 adbdump 是「目录 → 子项 name」的树形输出，
@@ -155,6 +158,20 @@ jobs:
             printf "%s" "$DUMP" | grep -c "name:"
             echo "=== 大小 ==="
             du -h $A
+
+            echo "=== 试装到空目录（证明包结构可被 apk 接受）==="
+            # alpine 里没有 luci-base/rpcd/ucode，依赖解不出来，
+            # 所以用 --no-depends 只看包本身能否解包落盘。
+            # 不同版本的 apk 可能不认这个开关，失败也不算错。
+            rm -rf /x && mkdir -p /x
+            if apk add --root /x --initdb --allow-untrusted --no-scripts \
+                       --no-depends $A >/tmp/inst.log 2>&1; then
+              echo "  安装成功，落盘文件："
+              find /x -type f -printf "  %10s  %p\n" | sort -k2
+            else
+              echo "  跳过（容器内缺少依赖或 apk 不支持该开关）："
+              sed "s/^/    /" /tmp/inst.log | head -8
+            fi
           '
 
       - name: Publish release
@@ -174,6 +191,14 @@ jobs:
           安装 / 升级（保留已配置的设备别名与禁网状态）：
           \`\`\`
           apk add --allow-untrusted --force-overwrite <apk>
+          /etc/init.d/lanmap enable && /etc/init.d/lanmap restart
+          \`\`\`
+
+          装完菜单在 **网络 → 设备管理**。
+
+          卸载（运行期产生的历史数据不归 apk 管，如需清理见 README）：
+          \`\`\`
+          apk del luci-app-lanmap
           \`\`\`
 
           依赖：luci-base rpcd nftables ucode ucode-mod-fs ucode-mod-uloop ucode-mod-uci
