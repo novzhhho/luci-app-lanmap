@@ -1,0 +1,172 @@
+name: Plugin APK
+
+# 插件是 ucode + JS，没有需要编译的东西。不走 OpenWrt SDK（那会连带编译
+# luci-base 的依赖，SDK 里缺头文件），直接用 apk-tools 3 的 mkpkg 把文件树
+# 打成 apk —— 和 OpenWrt 官方打包用的是同一套参数。
+#
+# 产物发布到 tag=<commit 短 sha> 的 Release。
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  PKG_NAME: luci-app-lanmap
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0        # 需要完整历史才能用 commit 数当 PKG_RELEASE
+
+      - name: Stamp version & build sha
+        id: v
+        run: |
+          set -euo pipefail
+          SHA7=$(git rev-parse --short=7 HEAD)
+          COUNT=$(git rev-list --count HEAD)
+          echo "sha=$SHA7"            >> "$GITHUB_OUTPUT"
+          echo "ver=0.1.0-r${COUNT}"  >> "$GITHUB_OUTPUT"
+          echo "commit 短 sha = $SHA7, commit 数 = $COUNT"
+
+      - name: Assemble package tree
+        run: |
+          set -euo pipefail
+          ROOT="build/pkgroot"
+          rm -rf build dist
+          mkdir -p "$ROOT" build/apkscripts dist
+
+          # ---- 文件树：和 luci.mk 的安装规则一致（htdocs → /www）----
+          install -D -m755 root/usr/sbin/lanmapd                              "$ROOT/usr/sbin/lanmapd"
+          install -D -m755 root/usr/libexec/rpcd/luci.lanmap                   "$ROOT/usr/libexec/rpcd/luci.lanmap"
+          install -D -m644 root/usr/share/lanmap/rpc.uc                        "$ROOT/usr/share/lanmap/rpc.uc"
+          install -D -m644 root/usr/share/lanmap/oui.tsv                       "$ROOT/usr/share/lanmap/oui.tsv"
+          install -D -m755 root/etc/init.d/lanmap                              "$ROOT/etc/init.d/lanmap"
+          install -D -m644 root/usr/share/luci/menu.d/luci-app-lanmap.json     "$ROOT/usr/share/luci/menu.d/luci-app-lanmap.json"
+          install -D -m644 root/usr/share/rpcd/acl.d/luci-app-lanmap.json      "$ROOT/usr/share/rpcd/acl.d/luci-app-lanmap.json"
+          install -D -m600 root/etc/config/lanmap                              "$ROOT/etc/config/lanmap"
+          install -D -m755 root/etc/uci-defaults/96_luci-app-lanmap            "$ROOT/etc/uci-defaults/96_luci-app-lanmap"
+          install -D -m644 htdocs/luci-static/resources/view/lanmap/overview.js \
+                          "$ROOT/www/luci-static/resources/view/lanmap/overview.js"
+
+          # ---- 构建指纹：界面显示 + 后续自更新比对 ----
+          mkdir -p "$ROOT/usr/share/luci-app-lanmap"
+          echo "${{ steps.v.outputs.sha }}" > "$ROOT/usr/share/luci-app-lanmap/build"
+          chmod 644 "$ROOT/usr/share/luci-app-lanmap/build"
+
+          # ---- 运行期数据目录 ----
+          mkdir -p "$ROOT/usr/share/lanmap/data"
+          chmod 755 "$ROOT/usr/share/lanmap/data"
+
+          # ---- 文件清单（apk 用它做 audit / 归属校验）----
+          mkdir -p "$ROOT/lib/apk/packages"
+          ( cd "$ROOT" && find . \( -type f -o -type l \) | sed 's|^\.||' | sort ) > "/tmp/$PKG_NAME.list"
+          mv "/tmp/$PKG_NAME.list" "$ROOT/lib/apk/packages/$PKG_NAME.list"
+
+          # ---- 安装脚本 ----
+          # 升级时正在处理请求的可能是 rpcd，reload 会把回包弄丢；
+          # 但这里的升级是用户手动 apk add，不经过 rpcd，所以可以安全 reload。
+          cat > build/apkscripts/post-install <<'EOS'
+          #!/bin/sh
+          mkdir -p /usr/share/lanmap/data /var/run/lanmap 2>/dev/null
+          /etc/init.d/rpcd reload >/dev/null 2>&1
+          /etc/init.d/lanmap enable >/dev/null 2>&1
+          /etc/init.d/lanmap restart >/dev/null 2>&1
+          exit 0
+          EOS
+          cat > build/apkscripts/post-upgrade <<'EOS'
+          #!/bin/sh
+          /etc/init.d/rpcd reload >/dev/null 2>&1
+          /etc/init.d/lanmap restart >/dev/null 2>&1
+          exit 0
+          EOS
+          chmod 755 build/apkscripts/post-install build/apkscripts/post-upgrade
+
+          echo '--- 打包内容 ---'
+          find "$ROOT" -type f | sort
+          du -sh "$ROOT"
+
+      - name: Build apk with mkpkg
+        env:
+          VER: ${{ steps.v.outputs.ver }}
+        run: |
+          set -euo pipefail
+          docker run --rm -v "$PWD:/w" -w /w -e SOURCE_DATE_EPOCH=0 alpine:edge sh -c '
+            set -e
+            apk --version
+            # 宿主 runner 的文件在容器里是 uid 1001（无 passwd 项），mkpkg 会
+            # 记成 nobody:nogroup；先归 0:0，装到路由器上才是 root:root
+            chown -R 0:0 /w/build /w/dist
+            apk mkpkg \
+              --info "name:luci-app-lanmap" \
+              --info "version:'"$VER"'" \
+              --info "arch:noarch" \
+              --info "description:LuCI app for LAN device management with per-device traffic accounting" \
+              --info "license:MIT" \
+              --info "origin:luci-app-lanmap" \
+              --info "url:https://github.com/novzhhho/luci-app-lanmap" \
+              --info "maintainer:novzhhho" \
+              --info "depends:libc luci-base rpcd nftables ucode ucode-mod-fs ucode-mod-uloop ucode-mod-uci" \
+              --script "post-install:/w/build/apkscripts/post-install" \
+              --script "post-upgrade:/w/build/apkscripts/post-upgrade" \
+              --files "/w/build/pkgroot" \
+              --output "/w/dist/luci-app-lanmap-'"$VER"'.apk"
+          '
+          # 容器里 chown 成 root 之后宿主 runner 就写不进 dist 了，这里还回来
+          sudo chown -R "$(id -u):$(id -g)" build dist
+          echo '--- 产物 ---'
+          ls -l dist/
+
+      - name: Verify apk metadata
+        run: |
+          set -euo pipefail
+          docker run --rm -v "$PWD:/w" -w /w alpine:edge sh -c '
+            set -e
+            apk adbdump /w/dist/*.apk | sed -n "1,70p"
+            echo "--- 文件清单 ---"
+            apk adbdump /w/dist/*.apk | grep -c "path:"
+          '
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.v.outputs.sha }}
+          VER: ${{ steps.v.outputs.ver }}
+        run: |
+          set -euo pipefail
+          ( cd dist && sha256sum *.apk > SHA256SUMS.txt )
+          cat > /tmp/notes.md <<EOF
+          luci-app-lanmap $VER (commit $TAG)
+
+          LuCI 局域网设备管理插件。用 nft 在 br-lan 的二层钩子上按设备计数，
+          自带 ucode 采样服务，不依赖 bandix。
+
+          安装 / 升级（保留已配置的设备别名与禁网状态）：
+          \`\`\`
+          apk add --allow-untrusted --force-overwrite <apk>
+          \`\`\`
+
+          依赖：luci-base rpcd nftables ucode ucode-mod-fs ucode-mod-uloop ucode-mod-uci
+          EOF
+
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$TAG" dist/* --repo "$GITHUB_REPOSITORY" \
+              --title "lanmap $TAG ($VER)" --notes-file /tmp/notes.md
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: luci-app-lanmap-apk
+          path: dist/*
+          if-no-files-found: error

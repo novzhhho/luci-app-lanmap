@@ -1,0 +1,13 @@
+* text=auto eol=lf
+
+# 路由器上的脚本和 ucode 必须是 LF，否则 shebang 会变成
+# "#!/usr/bin/ucode\r" 而找不到解释器
+*.sh      text eol=lf
+*.uc      text eol=lf
+*.js      text eol=lf
+*.json    text eol=lf
+*.yml     text eol=lf
+*.tsv     text eol=lf
+Makefile  text eol=lf
+lanmapd       text eol=lf
+luci.lanmap   text eol=lf

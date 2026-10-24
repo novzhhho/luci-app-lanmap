@@ -1,0 +1,42 @@
+#!/bin/sh
+# luci-app-lanmap —— rpcd 后端
+#
+# rpcd 协议：`<script> list` 输出方法表；`<script> call <method>` 从 stdin
+# 读 JSON 参数，把结果 JSON 打到 stdout。
+#
+# 这里只是协议壳，真正的逻辑在 /usr/share/lanmap/rpc.uc：
+# 用 ucode 是为了能直接解析 nft 的 JSON、读 TSV、查 OUI 表，
+# 用 shell 做这些会又慢又难读。
+
+BIN=/usr/bin/ucode
+LIB=/usr/share/lanmap/rpc.uc
+
+case "$1" in
+	list)
+		cat <<-'EOF'
+		{
+			"devices": {},
+			"detail":  { "mac": "str" },
+			"setmeta": { "mac": "str", "name": "str", "type": "str", "group": "str", "blocked": "bool" },
+			"scan":    {},
+			"summary": {},
+			"status":  {},
+			"log":     {}
+		}
+		EOF
+		;;
+	call)
+		case "$2" in
+			devices|detail|setmeta|scan|summary|status|log)
+				exec "$BIN" "$LIB" "$2"
+				;;
+			*)
+				echo '{"ok":false,"error":"未知方法"}'
+				;;
+		esac
+		;;
+	*)
+		echo "usage: $0 list | call <method>" >&2
+		exit 1
+		;;
+esac

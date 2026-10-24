@@ -1,0 +1,7 @@
+# 构建时由 CI 写入当前 commit 短 sha
+root/usr/share/luci-app-lanmap/build
+
+# 本地开发用
+.stage/
+*.apk
+*.ipk

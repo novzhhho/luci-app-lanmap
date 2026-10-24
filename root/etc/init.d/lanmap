@@ -1,0 +1,30 @@
+#!/bin/sh /etc/rc.common
+
+START=96
+STOP=10
+USE_PROCD=1
+
+start_service() {
+	config_load lanmap
+
+	local enabled
+	config_get_bool enabled main enabled 1
+	[ "$enabled" = "1" ] || return 0
+
+	procd_open_instance lanmapd
+	procd_set_param command /usr/bin/ucode /usr/sbin/lanmapd
+	# 崩溃自动拉起，但限制频率，避免配置错误时反复重启
+	procd_set_param respawn 3600 5 5
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+	procd_close_instance
+}
+
+service_triggers() {
+	procd_add_reload_trigger 'lanmap'
+}
+
+reload_service() {
+	stop
+	start
+}

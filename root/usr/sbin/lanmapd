@@ -1,0 +1,550 @@
+#!/usr/bin/ucode
+'use strict';
+
+/*
+ * lanmapd —— 局域网设备流量采集服务
+ *
+ * 为什么不用 forward 钩子：
+ *   本机 WAN 是 PPPoE，下行包从 PPP 隧道进来时没有以太网头，
+ *   在 inet forward 钩子上用 ether daddr 匹配恒为 0（实测下载 157MB 只记到 2.5MB ACK）。
+ *   所以计数挂在 br-lan 的二层钩子上：
+ *     ingress + ether saddr -> 该设备发出的字节
+ *     egress  + ether daddr -> 发给该设备的字节
+ *   实测下载 292MB 记到下行 343MB、上行 1.8MB，方向与量级都对。
+ *
+ * 为什么每个设备一条规则：
+ *   本机 nft 1.1.6 上 meter{}、counter name @map、update @set 三种写法全是语法错误，
+ *   唯一可用的是「命名 counter 对象 + 每设备一条匹配规则」。
+ *
+ * 采样与落盘分离：
+ *   5 秒读一次计数器算速率 -> /var/run/lanmap/state.json（tmpfs，不写闪存）
+ *   15 分钟把增量 append 到 hourly.tsv（同日多行，读取时按小时求和）
+ *   每天把超过 7 天的 hourly 行折叠进 daily.tsv，并裁掉超期数据
+ */
+
+require('uloop');
+
+let fs = require('fs');
+let uci = require('uci');
+let uloop = require('uloop');
+
+let RUNDIR = '/var/run/lanmap';
+let STATEF = RUNDIR + '/state.json';
+let DATADIR = '/usr/share/lanmap/data';
+let HOURLY = DATADIR + '/hourly.tsv';
+let DAILY = DATADIR + '/daily.tsv';
+let TABLE = 'lanmap';
+
+let cfg = { enabled: true, iface: '', interval: 5, max_devices: 200, retention: 90 };
+let iface = 'br-lan';
+let known = {};       /* mac -> true  已建过计数规则的 */
+let prev = {};        /* mac -> { u, d }  上一轮计数器绝对值 */
+let prevT = 0;        /* 上一轮采样的时间戳（秒），用于算速率 */
+let rates = {};       /* mac -> { ru, rd, last } */
+let hourAcc = {};     /* mac -> { u, d }  自上次落盘以来的增量 */
+let hist = {};        /* mac -> [[ru, rd], ...]  最近 60 个采样点，供详情页画实时曲线 */
+let lastFlush = 0;
+let lastRollup = 0;
+let logfile = '/var/log/lanmapd.log';
+
+/* ---------------- 基础工具 ---------------- */
+
+function log(msg) {
+	let line = sprintf('[%d] %s\n', time(), msg);
+	try {
+		let f = fs.open(logfile, 'a');
+		if (f) { f.write(line); f.close(); }
+	} catch (e) { }
+}
+
+function readfile(p) {
+	try {
+		let v = fs.readfile(p);
+		return v ? v : '';
+	} catch (e) {
+		return '';
+	}
+}
+
+function writefile_atomic(p, data) {
+	try {
+		let tmp = p + '.tmp';
+		let f = fs.open(tmp, 'w');
+		if (!f) return false;
+		f.write(data);
+		f.close();
+		fs.rename(tmp, p);
+		return true;
+	} catch (e) {
+		log('write ' + p + ' failed: ' + e);
+		return false;
+	}
+}
+
+function append_file(p, data) {
+	try {
+		let f = fs.open(p, 'a');
+		if (!f) return false;
+		f.write(data);
+		f.close();
+		return true;
+	} catch (e) {
+		log('append ' + p + ' failed: ' + e);
+		return false;
+	}
+}
+
+function run(cmd) {
+	let out = '';
+	try {
+		let p = fs.popen(cmd);
+		if (!p) return '';
+		out = p.read('all');
+		p.close();
+	} catch (e) {
+		return '';
+	}
+	return out ? out : '';
+}
+
+function hex2mac(h) {
+	if (type(h) != 'string' || length(h) != 12) return null;
+	return sprintf('%s:%s:%s:%s:%s:%s',
+		substr(h, 0, 2), substr(h, 2, 2), substr(h, 4, 2),
+		substr(h, 6, 2), substr(h, 8, 2), substr(h, 10, 2));
+}
+
+function mac2hex(mac) {
+	return replace(lc(mac), /:/g, '');
+}
+
+/* ---------------- 配置与接口 ---------------- */
+
+function load_cfg() {
+	try {
+		let ctx = uci.cursor();
+		let v;
+
+		v = ctx.get('lanmap', 'main', 'enabled');
+		if (v != null) cfg.enabled = (v == '1' || v == 'true' || v == 'yes');
+
+		v = ctx.get('lanmap', 'main', 'interface');
+		if (v) cfg.iface = v;
+
+		v = ctx.get('lanmap', 'main', 'interval');
+		if (v) cfg.interval = int(v);
+		if (cfg.interval < 1) cfg.interval = 5;
+
+		v = ctx.get('lanmap', 'main', 'max_devices');
+		if (v) cfg.max_devices = int(v);
+		if (cfg.max_devices < 8) cfg.max_devices = 8;
+
+		v = ctx.get('lanmap', 'main', 'retention_days');
+		if (v) cfg.retention = int(v);
+		if (cfg.retention < 1) cfg.retention = 90;
+	} catch (e) {
+		log('config: ' + e);
+	}
+}
+
+function detect_iface() {
+	if (cfg.iface) return cfg.iface;
+
+	let out = run('ubus call network.interface.lan status 2>/dev/null');
+	if (out) {
+		let d = null;
+		try { d = json(out); } catch (e) { }
+		if (type(d) == 'object') {
+			if (type(d.l3_device) == 'string' && d.l3_device) return d.l3_device;
+			if (type(d.device) == 'string' && d.device) return d.device;
+		}
+	}
+
+	out = run('ip -o link show type bridge 2>/dev/null | head -1');
+	let m = match(out, /:\s+([A-Za-z0-9_.-]+):/);
+	if (m) return m[1];
+
+	return 'br-lan';
+}
+
+/* ---------------- nft 表管理 ---------------- */
+
+function table_exists() {
+	let out = run(sprintf('nft list table netdev %s 2>/dev/null | head -1', TABLE));
+	return index(out, 'table netdev ' + TABLE) >= 0;
+}
+
+function reset_table() {
+	run(sprintf('nft delete table netdev %s 2>/dev/null', TABLE));
+
+	let s = '';
+	s += sprintf('add table netdev %s\n', TABLE);
+	s += sprintf('add chain netdev %s lanin { type filter hook ingress device "%s" priority -150; policy accept; }\n', TABLE, iface);
+	s += sprintf('add chain netdev %s lanout { type filter hook egress device "%s" priority -150; policy accept; }\n', TABLE, iface);
+
+	let f = '/tmp/.lanmap-init.nft';
+	writefile_atomic(f, s);
+	let err = run(sprintf('nft -f %s 2>&1', f));
+	fs.unlink(f);
+
+	if (err && index(err, 'Error') >= 0) {
+		log('reset table failed: ' + trim(err));
+		return false;
+	}
+	return true;
+}
+
+function add_devices(macs) {
+	if (!length(macs)) return;
+	if (length(keys(known)) + length(macs) > cfg.max_devices) {
+		log(sprintf('超过设备上限 %d，跳过新增', cfg.max_devices));
+		return;
+	}
+
+	let s = '';
+	for (let mac in macs) {
+		let h = mac2hex(mac);
+		s += sprintf('add counter netdev %s ul_%s\n', TABLE, h);
+		s += sprintf('add counter netdev %s dl_%s\n', TABLE, h);
+		s += sprintf('add rule netdev %s lanin ether saddr %s counter name "ul_%s"\n', TABLE, mac, h);
+		s += sprintf('add rule netdev %s lanout ether daddr %s counter name "dl_%s"\n', TABLE, mac, h);
+	}
+
+	let f = '/tmp/.lanmap-add.nft';
+	writefile_atomic(f, s);
+	let err = run(sprintf('nft -f %s 2>&1', f));
+	fs.unlink(f);
+
+	if (err && index(err, 'Error') >= 0) {
+		/* 有一条失败就整批不认，交给下一轮重试 */
+		log('add devices failed: ' + trim(err));
+		return;
+	}
+
+	for (let mac in macs)
+		known[mac] = true;
+}
+
+/* 已经在 nft 里有计数器的设备（重启后 table 若是我们删掉重建的，这里是空的） */
+function existing_counters() {
+	let out = run(sprintf('nft -j list table netdev %s 2>/dev/null', TABLE));
+	let macs = {};
+	if (!out) return macs;
+
+	let doc = null;
+	try { doc = json(out); } catch (e) { return macs; }
+	if (type(doc) != 'object') return macs;
+
+	let arr = doc.nftables;
+	if (type(arr) != 'array') return macs;
+
+	for (let it in arr) {
+		let c = it.counter;
+		if (type(c) != 'object') continue;
+		let n = c.name;
+		if (type(n) != 'string') continue;
+		if (substr(n, 0, 2) != 'ul') continue;
+		let mac = hex2mac(substr(n, 3));
+		if (mac) macs[mac] = true;
+	}
+	return macs;
+}
+
+/* ---------------- 设备发现 ---------------- */
+
+function discover() {
+	let macs = {};
+	let out, line, m, f;
+
+	/* 邻居表：在线的 */
+	out = run(sprintf('ip neigh show dev %s 2>/dev/null', iface));
+	for (line in split(out, '\n')) {
+		m = match(line, /lladdr ([0-9a-fA-F]{2}(:[0-9a-fA-F]{2}){5})/);
+		if (m) macs[lc(m[1])] = true;
+	}
+
+	/* DHCP 租约：可能有已休眠但仍在租期内的 */
+	out = readfile('/tmp/dhcp.leases');
+	for (line in split(out, '\n')) {
+		line = trim(line);
+		if (!line) continue;
+		f = split(line, ' ');
+		if (length(f) >= 2 && match(f[1], /^[0-9a-fA-F]{2}(:[0-9a-fA-F]{2}){5}$/))
+			macs[lc(f[1])] = true;
+	}
+
+	return macs;
+}
+
+/* ---------------- 采样 ---------------- */
+
+function sample() {
+	let out = run(sprintf('nft -j list table netdev %s 2>/dev/null', TABLE));
+	if (!out) return;
+
+	let doc = null;
+	try { doc = json(out); } catch (e) { return; }
+	if (type(doc) != 'object') return;
+
+	let arr = doc.nftables;
+	if (type(arr) != 'array') return;
+
+	let t = time();
+	let cur = {};
+
+	for (let it in arr) {
+		let c = it.counter;
+		if (type(c) != 'object') continue;
+
+		let n = c.name;
+		if (type(n) != 'string') continue;
+
+		let pre = substr(n, 0, 2);
+		if (pre != 'ul' && pre != 'dl') continue;
+
+		let mac = hex2mac(substr(n, 3));
+		if (!mac) continue;
+
+		let e = cur[mac];
+		if (!e) { e = { u: 0, d: 0 }; cur[mac] = e; }
+
+		let bytes = int(c.bytes);
+		if (pre == 'ul') e.u = bytes; else e.d = bytes;
+	}
+
+	for (let mac, e in cur) {
+		let pv = prev[mac];
+		let ru = 0, rd = 0;
+
+		if (pv) {
+			let dt = t - prevT;
+			if (dt <= 0) dt = cfg.interval;
+
+			let du = e.u - pv.u;
+			let dd = e.d - pv.d;
+
+			/* 负数说明计数器被重建了（表重置），本轮只重新校准，不计增量 */
+			if (du >= 0 && dd >= 0) {
+				ru = du / dt;
+				rd = dd / dt;
+
+				let a = hourAcc[mac];
+				if (!a) { a = { u: 0, d: 0 }; hourAcc[mac] = a; }
+				a.u += du;
+				a.d += dd;
+				known[mac] = true;
+			}
+		}
+
+		let r = rates[mac];
+		if (!r) { r = { ru: 0, rd: 0, last: 0 }; rates[mac] = r; }
+		r.ru = ru;
+		r.rd = rd;
+		if (e.u > 0 || e.d > 0) r.last = t;
+
+		let h = hist[mac];
+		if (!h) { h = []; hist[mac] = h; }
+		push(h, [int(ru), int(rd)]);
+		if (length(h) > 60) h = slice(h, length(h) - 60);
+		hist[mac] = h;
+	}
+
+	prev = cur;
+	prevT = t;
+}
+
+function write_state() {
+	let t = time();
+	let devs = {};
+
+	for (let mac, r in rates) {
+		let pv = prev[mac];
+		devs[mac] = {
+			u: pv ? pv.u : 0,
+			d: pv ? pv.d : 0,
+			ru: int(r.ru),
+			rd: int(r.rd),
+			last: r.last,
+			h: hist[mac] ? hist[mac] : []
+		};
+	}
+
+	/* hourAcc 是还没落盘的增量。界面上的「今日/累计」要把这部分算进去，
+	 * 否则最多会有 15 分钟的延迟，用户会以为统计不准。 */
+	let acc = {};
+	for (let mac, a in hourAcc)
+		acc[mac] = { u: int(a.u), d: int(a.d) };
+
+	let st = { ts: t, iface: iface, acc: acc, devs: devs };
+	writefile_atomic(STATEF, sprintf('%J', st));
+}
+
+/* ---------------- 落盘 ---------------- */
+
+function flush_hour() {
+	let mark = int(time() / 900) * 900;
+	if (mark == lastFlush) return;
+	lastFlush = mark;
+
+	let lines = '';
+	let n = 0;
+	for (let mac, a in hourAcc) {
+		if (a.u > 0 || a.d > 0) {
+			lines += sprintf('%d\t%s\t%d\t%d\n', mark, mac, a.u, a.d);
+			n++;
+		}
+	}
+	hourAcc = {};
+	if (n) append_file(HOURLY, lines);
+}
+
+function read_tsv(p) {
+	let rows = [];
+	let out = readfile(p);
+	for (let line in split(out, '\n')) {
+		line = trim(line);
+		if (!line) continue;
+		let f = split(line, '\t');
+		if (length(f) < 4) continue;
+		push(rows, { ts: int(f[0]), mac: f[1], u: int(f[2]), d: int(f[3]) });
+	}
+	return rows;
+}
+
+/*
+ * 每天一次：
+ *   - 把 7 天以前的 hourly 行按天折叠进 daily.tsv
+ *   - 裁掉超过 retention_days 的 daily 行
+ * 这样「累计」= sum(hourly) + sum(daily) 不会因为裁剪而倒退。
+ */
+function rollup() {
+	let t = time();
+	let today = int(t / 86400) * 86400;
+	let cutoff = today - 6 * 86400;
+
+	let rows = read_tsv(HOURLY);
+	let keep = '';
+	let move = {};
+
+	for (let r in rows) {
+		if (r.ts >= cutoff) {
+			keep += sprintf('%d\t%s\t%d\t%d\n', r.ts, r.mac, r.u, r.d);
+		} else {
+			let day = int(r.ts / 86400) * 86400;
+			let k = day + '|' + r.mac;
+			let e = move[k];
+			if (!e) { e = { ts: day, mac: r.mac, u: 0, d: 0 }; move[k] = e; }
+			e.u += r.u;
+			e.d += r.d;
+		}
+	}
+
+	let dmap = {};
+	let drows = read_tsv(DAILY);
+	let dcut = today - cfg.retention * 86400;
+
+	for (let r in drows) {
+		if (r.ts >= dcut) dmap[r.ts + '|' + r.mac] = r;
+	}
+
+	for (let k, e in move) {
+		let o = dmap[k];
+		if (o) { o.u += e.u; o.d += e.d; }
+		else dmap[k] = e;
+	}
+
+	let list = [];
+	for (let k, e in dmap) push(list, e);
+	sort(list, function (a, b) { return a.ts - b.ts; });
+
+	let out = '';
+	for (let r in list)
+		out += sprintf('%d\t%s\t%d\t%d\n', r.ts, r.mac, r.u, r.d);
+
+	writefile_atomic(DAILY, out);
+	writefile_atomic(HOURLY, keep);
+
+	log(sprintf('rollup: hourly %d -> %d 行, daily %d 行', length(rows), length(keep) ? length(split(trim(keep), '\n')) : 0, length(list)));
+}
+
+/* ---------------- 主循环 ---------------- */
+
+let tick = 0;
+
+function loop() {
+	tick++;
+
+	/* 设备发现每 6 轮（默认 30 秒）做一次，采样每轮都做 */
+	if (tick == 1 || (tick % 6) == 0) {
+		let macs = discover();
+		let missing = {};
+		for (let mac in macs) {
+			if (!known[mac]) missing[mac] = true;
+		}
+		if (length(keys(missing))) add_devices(missing);
+	}
+
+	sample();
+	write_state();
+	flush_hour();
+
+	/* 每天 03:17 之后跑一次整理 */
+	let t = time();
+	let day = int(t / 86400);
+	if (day != lastRollup && (t % 86400) > 3 * 3600 + 17 * 60) {
+		lastRollup = day;
+		rollup();
+	}
+}
+
+function on_term() {
+	log('收到退出信号，落盘');
+	flush_hour();
+	run(sprintf('nft delete table netdev %s 2>/dev/null', TABLE));
+}
+
+/* ---------------- 启动 ---------------- */
+
+load_cfg();
+
+if (!cfg.enabled) {
+	log('未启用，退出');
+	exit(0);
+}
+
+try { fs.mkdir(RUNDIR, 0o755); } catch (e) { }
+try { fs.mkdir(DATADIR, 0o755); } catch (e) { }
+
+iface = detect_iface();
+
+if (!reset_table()) {
+	log('无法建立计数表，退出');
+	exit(1);
+}
+
+/* 建表后把已知设备补回来 —— 设备清单来自邻居表与租约 */
+let init = discover();
+if (length(keys(init))) add_devices(init);
+
+lastFlush = int(time() / 900) * 900;
+lastRollup = int(time() / 86400);
+
+log(sprintf('启动: 接口=%s 周期=%ds 设备=%d', iface, cfg.interval, length(keys(init))));
+
+let tmr = null;
+tmr = uloop.timer(cfg.interval * 1000, function () {
+	loop();
+	tmr.set(cfg.interval * 1000);
+});
+
+try {
+	uloop.signal('SIGTERM', function () { on_term(); uloop.end(); });
+	uloop.signal('SIGINT', function () { on_term(); uloop.end(); });
+} catch (e) {
+	log('signal handler 注册失败: ' + e);
+}
+
+/* 先跑一轮，避免界面上前几秒是空的 */
+loop();
+
+uloop.run();

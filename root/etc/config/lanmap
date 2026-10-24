@@ -1,0 +1,10 @@
+config lanmap 'main'
+	option enabled '1'
+	# 采集接口，留空则自动选择第一个 bridge（通常是 br-lan）。
+	# 设备计数挂在二层钩子上，所以这里必须是 LAN 侧的桥。
+	option interface ''
+	option interval '5'
+	# 最多为多少台设备建计数规则。超出时按最久未活跃淘汰，防止规则表膨胀。
+	option max_devices '200'
+	# 历史数据保留天数（1 小时颗粒度）
+	option retention_days '90'

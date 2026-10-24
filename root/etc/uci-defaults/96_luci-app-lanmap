@@ -1,0 +1,20 @@
+#!/bin/sh
+# 首次安装：让 ubus 上的 luci.lanmap 对象注册出来，并启动采集服务。
+# 升级时不要动服务，否则正在进行的请求会断。
+
+[ -x /usr/sbin/lanmapd ] || exit 0
+
+# 建好数据目录（/usr/share/lanmap 属于包，data 子目录留给运行期）
+mkdir -p /usr/share/lanmap/data 2>/dev/null
+mkdir -p /var/run/lanmap 2>/dev/null
+
+/etc/init.d/rpcd reload >/dev/null 2>&1
+
+if /etc/init.d/lanmap enabled 2>/dev/null; then
+	/etc/init.d/lanmap restart >/dev/null 2>&1
+else
+	/etc/init.d/lanmap enable >/dev/null 2>&1
+	/etc/init.d/lanmap start >/dev/null 2>&1
+fi
+
+exit 0

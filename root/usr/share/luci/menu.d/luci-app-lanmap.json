@@ -1,0 +1,13 @@
+{
+	"admin/network/lanmap": {
+		"title": "设备管理",
+		"order": 25,
+		"action": {
+			"type": "view",
+			"path": "lanmap/overview"
+		},
+		"depends": {
+			"acl": [ "luci-app-lanmap" ]
+		}
+	}
+}

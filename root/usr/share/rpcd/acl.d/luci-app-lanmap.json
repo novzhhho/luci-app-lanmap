@@ -1,0 +1,15 @@
+{
+	"luci-app-lanmap": {
+		"description": "Grant access to the lanmap ubus object",
+		"read": {
+			"ubus": {
+				"luci.lanmap": [ "devices", "detail", "summary", "status", "log" ]
+			}
+		},
+		"write": {
+			"ubus": {
+				"luci.lanmap": [ "setmeta", "scan" ]
+			}
+		}
+	}
+}
