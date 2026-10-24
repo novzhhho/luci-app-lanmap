@@ -128,11 +128,33 @@ jobs:
       - name: Verify apk metadata
         run: |
           set -euo pipefail
+          # 用 docker 里的 apk 是为了和打包时的 apk-tools 3 版本一致
           docker run --rm -v "$PWD:/w" -w /w alpine:edge sh -c '
             set -e
-            apk adbdump /w/dist/*.apk | sed -n "1,70p"
-            echo "--- 文件清单 ---"
-            apk adbdump /w/dist/*.apk | grep -c "path:"
+            A=/w/dist/luci-app-lanmap-*.apk
+
+            echo "=== 包信息 ==="
+            apk adbdump $A | head -30
+
+            echo "=== 必须存在的文件 ==="
+            # apk-tools 3 的 adbdump 是「目录 → 子项 name」的树形输出，
+            # 没有 path: 字段，所以按 basename 逐个断言。
+            DUMP=$(apk adbdump $A)
+            for f in lanmapd luci.lanmap rpc.uc oui.tsv \
+                     luci-app-lanmap.json lanmap overview.js \
+                     96_luci-app-lanmap luci-app-lanmap.list build; do
+              if printf "%s" "$DUMP" | grep -q "name: $f\$"; then
+                echo "  ok   $f"
+              else
+                echo "  FAIL $f 缺失"
+                exit 1
+              fi
+            done
+
+            echo "=== 文件数 ==="
+            printf "%s" "$DUMP" | grep -c "name:"
+            echo "=== 大小 ==="
+            du -h $A
           '
 
       - name: Publish release
