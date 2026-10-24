@@ -8,7 +8,10 @@
 mkdir -p /usr/share/lanmap/data 2>/dev/null
 mkdir -p /var/run/lanmap 2>/dev/null
 
-/etc/init.d/rpcd reload >/dev/null 2>&1
+# 必须 restart 而不是 reload：rpcd 的 reload 只是发信号、进程不重启，
+# 新装的 ACL 读不进去，旧会话会被 LuCI 判成「无权限」，菜单项直接不显示。
+rm -f /tmp/luci-indexcache* 2>/dev/null
+/etc/init.d/rpcd restart >/dev/null 2>&1
 
 if /etc/init.d/lanmap enabled 2>/dev/null; then
 	/etc/init.d/lanmap restart >/dev/null 2>&1
