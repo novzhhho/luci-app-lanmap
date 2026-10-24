@@ -158,20 +158,6 @@ jobs:
             printf "%s" "$DUMP" | grep -c "name:"
             echo "=== 大小 ==="
             du -h $A
-
-            echo "=== 试装到空目录（证明包结构可被 apk 接受）==="
-            # alpine 里没有 luci-base/rpcd/ucode，依赖解不出来，
-            # 所以用 --no-depends 只看包本身能否解包落盘。
-            # 不同版本的 apk 可能不认这个开关，失败也不算错。
-            rm -rf /x && mkdir -p /x
-            if apk add --root /x --initdb --allow-untrusted --no-scripts \
-                       --no-depends $A >/tmp/inst.log 2>&1; then
-              echo "  安装成功，落盘文件："
-              find /x -type f -printf "  %10s  %p\n" | sort -k2
-            else
-              echo "  跳过（容器内缺少依赖或 apk 不支持该开关）："
-              sed "s/^/    /" /tmp/inst.log | head -8
-            fi
           '
 
       - name: Publish release
